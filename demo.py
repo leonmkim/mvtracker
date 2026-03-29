@@ -3,11 +3,20 @@ import os
 import warnings
 
 import numpy as np
-import rerun as rr  # pip install rerun-sdk==0.21.0
+import rerun as rr
 import torch
 from huggingface_hub import hf_hub_download
 
 from mvtracker.utils.visualizer_rerun import log_pointclouds_to_rerun, log_tracks_to_rerun
+
+
+def _connect_rerun_stream() -> None:
+    if hasattr(rr, "connect_grpc"):
+        rr.connect_grpc()
+    elif hasattr(rr, "connect_tcp"):
+        rr.connect_tcp()
+    else:
+        raise RuntimeError("Installed rerun SDK supports neither connect_grpc nor connect_tcp.")
 
 
 def main():
@@ -21,7 +30,7 @@ def main():
             "If 'spawn', make sure a rerun window can be spawned in your environment. "
             "If 'stream', make sure a rerun instance is running at port 9876. "
             "If 'save', the recording will be saved to a `.rrd` file that can be drag-and-dropped into "
-            "a running rerun viewer, including the online viewer at https://app.rerun.io/version/0.21.0. "
+            "a running rerun viewer, including the online viewer at https://app.rerun.io. "
             "For the online viewer, you want to create low memory-usage recordings with --lightweight."
         ),
     )
@@ -30,7 +39,7 @@ def main():
         action="store_true",
         help=(
             "Use lightweight rerun logging (less memory usage). This is recommended if you want to "
-            "view the recording in the online Rerun viewer at https://app.rerun.io/version/0.21.0."
+            "view the recording in the online Rerun viewer at https://app.rerun.io."
         ),
     )
     p.add_argument(
@@ -46,7 +55,14 @@ def main():
             "Note that rerun prefers recordings to have a .rrd suffix."
         ),
     )
+    p.add_argument(
+        "rrd_positional",
+        nargs="?",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     args = p.parse_args()
+    rrd_path = args.rrd_positional if args.rrd_positional is not None else args.rrd
     np.random.seed(72)
     torch.manual_seed(72)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -115,9 +131,11 @@ def main():
     # Visualize results
     rr.init("3dpt", recording_id="v0.16")
     if args.rerun == "stream":
-        rr.connect_tcp()
+        _connect_rerun_stream()
     elif args.rerun == "spawn":
         rr.spawn()
+    # Rerun >=0.30 tends to be more reliable with the lightweight track layout.
+    use_lightweight_track_logging = args.lightweight or hasattr(rr, "set_time")
     log_pointclouds_to_rerun(
         dataset_name="demo",
         datapoint_idx=0,
@@ -158,11 +176,11 @@ def main():
         track_batch_size=50,
         method_id=None,
         color_per_method_id=None,
-        memory_lightweight_logging=args.lightweight,
+        memory_lightweight_logging=use_lightweight_track_logging,
     )
     if args.rerun == "save":
-        rr.save(args.rrd)
-        print(f"Saved Rerun recording to: {os.path.abspath(args.rrd)}")
+        rr.save(rrd_path)
+        print(f"Saved Rerun recording to: {os.path.abspath(rrd_path)}")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,10 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 from matplotlib import cm
-from moviepy.editor import ImageSequenceClip
+try:
+    from moviepy.editor import ImageSequenceClip
+except ModuleNotFoundError:
+    from moviepy import ImageSequenceClip
 
 from mvtracker.models.core.model_utils import world_space_to_pixel_xy_and_camera_z
 

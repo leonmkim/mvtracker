@@ -35,6 +35,14 @@ def setup_libs(latex=False):
     })
 
 
+def _set_time_seconds_compat(timeline: str, seconds: float) -> None:
+    # Rerun <=0.21 used set_time_seconds, while newer versions use set_time(..., duration=...).
+    if hasattr(rr, "set_time"):
+        rr.set_time(timeline, duration=float(seconds))
+    else:
+        rr.set_time_seconds(timeline, seconds)
+
+
 def log_pointclouds_to_rerun(
         dataset_name: str,
         datapoint_idx: Union[int, str],
@@ -59,7 +67,7 @@ def log_pointclouds_to_rerun(
 ):
     # Set the up-axis for the world
     # Log coordinate axes for reference
-    rr.set_time_seconds("frame", 0)
+    _set_time_seconds_compat("frame", 0)
     B, V, T, _, H, W = rgbs.shape
     assert rgbs.shape == (B, V, T, 3, H, W)
     assert depths.shape == (B, V, T, 1, H, W)
@@ -80,7 +88,7 @@ def log_pointclouds_to_rerun(
             if timesteps_to_log is not None and t not in timesteps_to_log:
                 continue
 
-            rr.set_time_seconds("frame", t / fps)
+            _set_time_seconds_compat("frame", t / fps)
 
             # Log RGB image
             rgb_image = rgbs[0, v, t].permute(1, 2, 0).cpu().numpy()
@@ -213,7 +221,7 @@ def _log_tracks_to_rerun(
             # if t not in [0] + [T * (x + 1) // 3 - 1 for x in range(3)]:
             # if t not in [T - 1]:
             #     continue
-            rr.set_time_seconds("frame", t / fps)
+            _set_time_seconds_compat("frame", t / fps)
 
             # Log the point (special handling for invisible points)
             if log_points:
@@ -300,7 +308,7 @@ def _log_tracks_to_rerun_lightweight(
     assert colors.shape == (N, 4)
 
     for t in range(T):
-        rr.set_time_seconds("frame", t / fps)
+        _set_time_seconds_compat("frame", t / fps)
         points_list, points_colors = [], []
         strips_list, strips_colors_list = [], []
         errors_list = []

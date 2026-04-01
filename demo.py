@@ -9,7 +9,6 @@ from huggingface_hub import hf_hub_download
 
 from mvtracker.utils.visualizer_rerun import log_pointclouds_to_rerun, log_tracks_to_rerun
 
-
 def _connect_rerun_stream() -> None:
     if hasattr(rr, "connect_grpc"):
         rr.connect_grpc()
@@ -136,6 +135,7 @@ def main():
         rr.spawn()
     # Rerun >=0.30 tends to be more reliable with the lightweight track layout.
     use_lightweight_track_logging = args.lightweight or hasattr(rr, "set_time")
+
     log_pointclouds_to_rerun(
         dataset_name="demo",
         datapoint_idx=0,
@@ -151,8 +151,8 @@ def main():
         bbox_crop=None,
         sphere_radius_crop=12.0,
         sphere_center_crop=np.array([0, 0, 0]),
-        log_rgb_image=False,
-        log_depthmap_as_image_v1=False,
+        log_rgb_image=True,
+        log_depthmap_as_image_v1=True,
         log_depthmap_as_image_v2=False,
         log_camera_frustrum=True,
         log_rgb_pointcloud=True,

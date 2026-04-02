@@ -58,6 +58,7 @@ class EvaluationPredictor(torch.nn.Module):
     ):
         previous_state = kwargs.pop("previous_state", None)
         return_rolling_state = bool(kwargs.pop("return_rolling_state", False))
+        use_persistent_query_state = previous_state is not None or return_rolling_state
         batch_size, num_views, num_frames, _, height_raw, width_raw = rgbs.shape
         _, num_points, _ = query_points_3d.shape
 
@@ -280,7 +281,7 @@ class EvaluationPredictor(torch.nn.Module):
                     debug_logs_path=debug_logs_path,
                     query_points_view=query_points_view,
                     previous_state=previous_state,
-                    persistent_query_count=1,
+                    persistent_query_count=(1 if use_persistent_query_state else None),
                     return_rolling_state=return_rolling_state,
                     **kwargs,
                 )
@@ -366,7 +367,7 @@ class EvaluationPredictor(torch.nn.Module):
                 debug_logs_path=debug_logs_path,
                 query_points_view=query_points_view,
                 previous_state=previous_state,
-                persistent_query_count=num_points,
+                persistent_query_count=(num_points if use_persistent_query_state else None),
                 return_rolling_state=return_rolling_state,
                 **kwargs,
             )

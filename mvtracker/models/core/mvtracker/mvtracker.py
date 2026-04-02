@@ -423,6 +423,9 @@ class MVTracker(nn.Module):
             debug_logs_path="",
             save_rerun_logs: bool = False,
             save_rerun_logs_output_rrd_path: Optional[str] = None,
+            previous_state: Optional[dict[str, torch.Tensor]] = None,
+            persistent_query_count: Optional[int] = None,
+            return_rolling_state: bool = False,
             **kwargs,
     ):
         device = extrs.device
@@ -442,6 +445,14 @@ class MVTracker(nn.Module):
         assert query_points.shape == (batch_size, num_points, 4)
         assert intrs.shape == (batch_size, num_views, num_frames, 3, 3)
         assert extrs.shape == (batch_size, num_views, num_frames, 3, 4)
+
+        if persistent_query_count is None:
+            persistent_query_count = num_points if (previous_state is not None or return_rolling_state) else 0
+        persistent_query_count = int(persistent_query_count)
+        if persistent_query_count < 0 or persistent_query_count > num_points:
+            raise ValueError(
+                f"persistent_query_count must be in [0, {num_points}] but got {persistent_query_count}"
+            )
 
         if save_debug_logs:
             os.makedirs(debug_logs_path, exist_ok=True)
@@ -498,6 +509,7 @@ class MVTracker(nn.Module):
         # Interpolate the rgbs and depthmaps to the stride of the SpaTracker
         strided_height = height // self.stride
         strided_width = width // self.stride
+        half_window = self.S // 2
 
         # Filter the points that never appear during 1 - T
         assert batch_size == 1, "Batch size > 1 is not supported yet"
@@ -511,7 +523,7 @@ class MVTracker(nn.Module):
         vis_init = query_points.new_ones((batch_size, self.S, num_points, 1)) * 10
 
         # Sort the queries via their first appeared time
-        _, sort_inds = torch.sort(query_points_t, dim=0, descending=False)
+        sort_inds = torch.argsort(query_points_t, dim=0, descending=False, stable=True)
         inv_sort_inds = torch.argsort(sort_inds, dim=0)
         assert torch.allclose(query_points_t, query_points_t[sort_inds][inv_sort_inds])
 
@@ -520,6 +532,13 @@ class MVTracker(nn.Module):
         coords_init_ = coords_init[..., sort_inds, :].clone()
         vis_init_ = vis_init[:, :, sort_inds].clone()
         track_mask_ = track_mask[:, :, sort_inds].clone()
+        if persistent_query_count > 0:
+            expected_persistent = torch.arange(persistent_query_count, device=sort_inds.device, dtype=sort_inds.dtype)
+            if not torch.equal(sort_inds[:persistent_query_count], expected_persistent):
+                raise ValueError(
+                    "Persistent queries must remain the first entries after stable time-sorting. "
+                    "Use query timesteps that keep the primary queries ahead of support/grid queries."
+                )
 
         # Delete the unsorted variables (for safety)
         del coords_init, vis_init, query_points_t, query_points, query_points_xyz_worldspace, track_mask
@@ -528,13 +547,82 @@ class MVTracker(nn.Module):
         traj_e_ = coords_init_.new_zeros((batch_size, num_frames, num_points, 3))
         vis_e_ = coords_init_.new_zeros((batch_size, num_frames, num_points))
 
-        w_idx_start = query_points_t_.min()
+        w_idx_start = int(query_points_t_.min().item())
         p_idx_start = 0
         vis_predictions = []
         coord_predictions = []
         p_idx_end_list = []
         fmaps_seq, depths_seq, feat_init, rerun_fmap_coloring_fn = None, None, None, None
-        while w_idx_start < num_frames - self.S // 2:
+        previous_coords_state = None
+        previous_vis_state = None
+        has_prior_window_predictions = False
+        if previous_state is not None:
+            required_keys = {"fmaps_seq", "depths_seq", "feat_init", "last_coords", "last_vis"}
+            missing_keys = required_keys.difference(previous_state)
+            if missing_keys:
+                raise ValueError(f"previous_state is missing keys: {sorted(missing_keys)}")
+            if w_idx_start != 0:
+                raise ValueError("previous_state requires query_points to start at local frame 0")
+            if persistent_query_count == 0:
+                raise ValueError("previous_state requires persistent_query_count > 0")
+            if not torch.all(query_points_t_[:persistent_query_count] == w_idx_start):
+                raise ValueError(
+                    "Persistent queries must begin at the first local frame when previous_state is provided"
+                )
+
+            fmaps_seq = previous_state["fmaps_seq"]
+            depths_seq = previous_state["depths_seq"]
+            feat_init = previous_state["feat_init"]
+            previous_coords_state = previous_state["last_coords"]
+            previous_vis_state = previous_state["last_vis"]
+
+            if fmaps_seq.shape != (
+                batch_size,
+                num_views,
+                half_window,
+                self.latent_dim,
+                strided_height,
+                strided_width,
+            ):
+                raise ValueError(
+                    "previous_state['fmaps_seq'] has incompatible shape "
+                    f"{tuple(fmaps_seq.shape)} for batch/view/window configuration"
+                )
+            if depths_seq.shape != (
+                batch_size,
+                num_views,
+                half_window,
+                1,
+                strided_height,
+                strided_width,
+            ):
+                raise ValueError(
+                    "previous_state['depths_seq'] has incompatible shape "
+                    f"{tuple(depths_seq.shape)} for batch/view/window configuration"
+                )
+            if feat_init.shape != (batch_size, self.S, persistent_query_count, self.latent_dim):
+                raise ValueError(
+                    "previous_state['feat_init'] has incompatible shape "
+                    f"{tuple(feat_init.shape)} for the persistent query count"
+                )
+            if previous_coords_state.shape != (batch_size, half_window, persistent_query_count, 3):
+                raise ValueError(
+                    "previous_state['last_coords'] has incompatible shape "
+                    f"{tuple(previous_coords_state.shape)} for the persistent query count"
+                )
+            if previous_vis_state.shape != (batch_size, half_window, persistent_query_count, 1):
+                raise ValueError(
+                    "previous_state['last_vis'] has incompatible shape "
+                    f"{tuple(previous_vis_state.shape)} for the persistent query count"
+                )
+            p_idx_start = persistent_query_count
+
+        last_window_fmaps = None
+        last_window_depths = None
+        last_window_len = 0
+        last_window_coords = None
+        last_window_vis_logits = None
+        while w_idx_start < num_frames - half_window:
             curr_wind_points = torch.nonzero(query_points_t_ < w_idx_start + self.S)
             assert curr_wind_points.shape[0] > 0
             p_idx_end = curr_wind_points[-1].item() + 1
@@ -546,32 +634,45 @@ class MVTracker(nn.Module):
             # Compute fmaps and interpolated depth on a rolling basis
             # to reduce peak GPU memory consumption, but don't recompute
             # for the overlapping part of a window
-            if fmaps_seq is None:
+            is_first_stateful_window = previous_state is not None and not has_prior_window_predictions
+            if is_first_stateful_window:
+                new_seq_t0 = w_idx_start + half_window
+            elif fmaps_seq is None:
                 assert depths_seq is None
                 new_seq_t0 = w_idx_start
             else:
-                fmaps_seq = fmaps_seq[:, :, self.S // 2:]
-                depths_seq = depths_seq[:, :, self.S // 2:]
-                new_seq_t0 = w_idx_start + self.S // 2
-            new_seq_t1 = w_idx_start + self.S
+                fmaps_seq = fmaps_seq[:, :, half_window:]
+                depths_seq = depths_seq[:, :, half_window:]
+                new_seq_t0 = w_idx_start + half_window
+            new_seq_t1 = min(w_idx_start + self.S, num_frames)
 
-            _depths_seq_new = nn.functional.interpolate(
-                input=depths[:, :, new_seq_t0:new_seq_t1].to(device).reshape(-1, 1, height, width),
-                scale_factor=1.0 / self.stride,
-                mode="nearest",
-            ).reshape(batch_size, num_views, -1, 1, strided_height, strided_width)
-            depths_seq = smart_cat(depths_seq, _depths_seq_new, dim=2)
+            if new_seq_t1 > new_seq_t0:
+                _depths_seq_new = nn.functional.interpolate(
+                    input=depths[:, :, new_seq_t0:new_seq_t1].to(device).reshape(-1, 1, height, width),
+                    scale_factor=1.0 / self.stride,
+                    mode="nearest",
+                ).reshape(batch_size, num_views, -1, 1, strided_height, strided_width)
+                depths_seq = smart_cat(depths_seq, _depths_seq_new, dim=2)
 
-            _fmaps_seq_new = self.fnet_fwd(
-                (2 * (rgbs[:, :, new_seq_t0: new_seq_t1].to(device) / 255.0) - 1.0),
-                image_features,
-            )
-            _fmaps_seq_new = nn.functional.interpolate(
-                input=_fmaps_seq_new,
-                size=(strided_height, strided_width),
-                mode="bilinear",
-            ).reshape(batch_size, num_views, -1, self.latent_dim, strided_height, strided_width)
-            fmaps_seq = smart_cat(fmaps_seq, _fmaps_seq_new, dim=2)
+                _fmaps_seq_new = self.fnet_fwd(
+                    (2 * (rgbs[:, :, new_seq_t0:new_seq_t1].to(device) / 255.0) - 1.0),
+                    image_features,
+                )
+                _fmaps_seq_new = nn.functional.interpolate(
+                    input=_fmaps_seq_new,
+                    size=(strided_height, strided_width),
+                    mode="bilinear",
+                ).reshape(batch_size, num_views, -1, self.latent_dim, strided_height, strided_width)
+                fmaps_seq = smart_cat(fmaps_seq, _fmaps_seq_new, dim=2)
+            else:
+                _depths_seq_new = depths.new_zeros(
+                    batch_size, num_views, 0, 1, strided_height, strided_width
+                )
+                if fmaps_seq is None:
+                    raise ValueError("No feature maps available for the current window")
+                _fmaps_seq_new = fmaps_seq.new_zeros(
+                    batch_size, num_views, 0, self.latent_dim, strided_height, strided_width
+                )
 
             if save_rerun_logs and rerun_fmap_coloring_fn is None:
                 valid_depths_mask = depths_seq.detach().cpu().squeeze(3) > 0
@@ -596,6 +697,9 @@ class MVTracker(nn.Module):
                 rerun_fmap_coloring_fn = fvec_to_rgb
 
             S_local = fmaps_seq.shape[2]
+            last_window_len = S_local
+            last_window_fmaps = fmaps_seq[:, :, :S_local].detach().clone()
+            last_window_depths = depths_seq[:, :, :S_local].detach().clone()
             if S_local < self.S:
                 diff = self.S - S_local
                 fmaps_seq = torch.cat([fmaps_seq, fmaps_seq[:, :, -1:].repeat(1, 1, diff, 1, 1, 1)], 2)
@@ -605,33 +709,49 @@ class MVTracker(nn.Module):
 
             # Compute the feature vector initialization for the new query points
             if p_idx_end - p_idx_start > 0:
+                init_fmaps = _fmaps_seq_new
+                init_depths = _depths_seq_new
+                init_intrs = intrs[:, :, new_seq_t0:new_seq_t1]
+                init_extrs = extrs[:, :, new_seq_t0:new_seq_t1]
+                init_t0 = new_seq_t0
+                init_t1 = new_seq_t1
+                if is_first_stateful_window:
+                    init_fmaps = last_window_fmaps
+                    init_depths = last_window_depths
+                    init_intrs = intrs[:, :, w_idx_start:w_idx_start + S_local]
+                    init_extrs = extrs[:, :, w_idx_start:w_idx_start + S_local]
+                    init_t0 = w_idx_start
+                    init_t1 = w_idx_start + S_local
+
                 rgbd_xyz, rgbd_fvec = init_pointcloud_from_rgbd(
-                    fmaps=_fmaps_seq_new,
-                    depths=_depths_seq_new,
-                    intrs=intrs[:, :, new_seq_t0:new_seq_t1],
-                    extrs=extrs[:, :, new_seq_t0:new_seq_t1],
+                    fmaps=init_fmaps,
+                    depths=init_depths,
+                    intrs=init_intrs,
+                    extrs=init_extrs,
                     stride=self.stride,
                 )
 
-                new_num_frames = _fmaps_seq_new.shape[2]
-                rgbd_xyz = rgbd_xyz.reshape(batch_size, new_num_frames, num_views, strided_height * strided_width, 3)
-                rgbd_fvec = rgbd_fvec.reshape(batch_size, new_num_frames, num_views, strided_height * strided_width,
+                init_num_frames = init_fmaps.shape[2]
+                rgbd_xyz = rgbd_xyz.reshape(batch_size, init_num_frames, num_views, strided_height * strided_width, 3)
+                rgbd_fvec = rgbd_fvec.reshape(batch_size, init_num_frames, num_views, strided_height * strided_width,
                                               self.latent_dim)
 
                 _feat_init_new = torch.zeros(batch_size, p_idx_end - p_idx_start, self.latent_dim,
-                                             device=_fmaps_seq_new.device, dtype=_fmaps_seq_new.dtype)
+                                             device=init_fmaps.device, dtype=init_fmaps.dtype)
                 assert batch_size == 1
-                assert ((query_points_t_[p_idx_start:p_idx_end] > new_seq_t0)
-                        | (query_points_t_[p_idx_start:p_idx_end] < new_seq_t1)).all()
+                assert (
+                    (query_points_t_[p_idx_start:p_idx_end] >= init_t0)
+                    & (query_points_t_[p_idx_start:p_idx_end] < init_t1)
+                ).all()
                 batch_idx = 0
-                for t in range(new_seq_t0, new_seq_t1):
+                for t in range(init_t0, init_t1):
                     query_mask = query_points_t_[p_idx_start:p_idx_end] == t
                     if query_mask.sum() == 0:
                         continue
                     query_points_world = query_points_xyz_worldspace_[batch_idx, p_idx_start:p_idx_end][query_mask]
 
-                    rgbd_xyz_current = rgbd_xyz[batch_idx, t - new_seq_t0].reshape(-1, 3)  # Combine views for frame
-                    rgbd_fvec_current = rgbd_fvec[batch_idx, t - new_seq_t0].reshape(-1, self.latent_dim)
+                    rgbd_xyz_current = rgbd_xyz[batch_idx, t - init_t0].reshape(-1, 3)  # Combine views for frame
+                    rgbd_fvec_current = rgbd_fvec[batch_idx, t - init_t0].reshape(-1, self.latent_dim)
 
                     k = 1
                     neighbor_dists, neighbor_indices = knn(k, rgbd_xyz_current[None],
@@ -645,14 +765,21 @@ class MVTracker(nn.Module):
                 feat_init = smart_cat(feat_init, _feat_init_new.repeat(1, self.S, 1, 1), dim=2)
 
             # Update the initial coordinates and visibility for non-first windows
-            if p_idx_start > 0:
-                last_coords = coords[-1][:, self.S // 2:].clone()  # Take the predicted coords from the last window
-                coords_init_[:, : self.S // 2, :p_idx_start] = last_coords
-                coords_init_[:, self.S // 2:, :p_idx_start] = last_coords[:, -1].repeat(1, self.S // 2, 1, 1)
+            if has_prior_window_predictions:
+                last_coords = coords[-1][:, half_window:].clone()  # Take the predicted coords from the last window
+                coords_init_[:, :half_window, :p_idx_start] = last_coords
+                coords_init_[:, half_window:, :p_idx_start] = last_coords[:, -1].repeat(1, half_window, 1, 1)
 
-                last_vis = vis[:, self.S // 2:][..., None]
-                vis_init_[:, : self.S // 2, :p_idx_start] = last_vis
-                vis_init_[:, self.S // 2:, :p_idx_start] = last_vis[:, -1].repeat(1, self.S // 2, 1, 1)
+                last_vis = vis[:, half_window:][..., None]
+                vis_init_[:, :half_window, :p_idx_start] = last_vis
+                vis_init_[:, half_window:, :p_idx_start] = last_vis[:, -1].repeat(1, half_window, 1, 1)
+            elif previous_state is not None and p_idx_start > 0:
+                if previous_coords_state is None or previous_vis_state is None:
+                    raise ValueError("previous_state did not provide the expected carry-over tensors")
+                coords_init_[:, :half_window, :p_idx_start] = previous_coords_state
+                coords_init_[:, half_window:, :p_idx_start] = previous_coords_state[:, -1].repeat(1, half_window, 1, 1)
+                vis_init_[:, :half_window, :p_idx_start] = previous_vis_state
+                vis_init_[:, half_window:, :p_idx_start] = previous_vis_state[:, -1].repeat(1, half_window, 1, 1)
 
             track_mask_current = track_mask_[:, w_idx_start: w_idx_start + self.S, :p_idx_end]
             if S_local < self.S:
@@ -691,11 +818,14 @@ class MVTracker(nn.Module):
 
             traj_e_[:, w_idx_start:w_idx_start + self.S, :p_idx_end] = coords[-1][:, :S_local]
             vis_e_[:, w_idx_start:w_idx_start + self.S, :p_idx_end] = torch.sigmoid(vis[:, :S_local])
+            last_window_coords = coords[-1][:, :S_local].detach().clone()
+            last_window_vis_logits = vis[:, :S_local].detach().clone()
 
             track_mask_[:, : w_idx_start + self.S, :p_idx_end] = 0.0
-            w_idx_start = w_idx_start + self.S // 2
+            w_idx_start = w_idx_start + half_window
 
             p_idx_start = p_idx_end
+            has_prior_window_predictions = True
 
         if save_debug_logs:
             import gpustat
@@ -720,6 +850,27 @@ class MVTracker(nn.Module):
             "feat_init": feat_init,
             "vis_e": vis_e,
         }
+        if return_rolling_state:
+            if last_window_fmaps is None or last_window_depths is None:
+                raise RuntimeError("Unable to export rolling_state because no local window was processed")
+            carry_len = min(half_window, last_window_len)
+            if carry_len <= 0:
+                raise RuntimeError("Unable to export rolling_state because the last window was empty")
+            carry_start = last_window_len - carry_len
+
+            feat_init_unsorted = feat_init[:, :, inv_sort_inds] if feat_init is not None else None
+            if last_window_coords is None or last_window_vis_logits is None or feat_init_unsorted is None:
+                raise RuntimeError("Rolling-state export is missing point-wise tensors from the last window")
+            last_coords_unsorted = last_window_coords[:, :, inv_sort_inds]
+            last_vis_unsorted = last_window_vis_logits[:, :, inv_sort_inds][..., None]
+
+            results["rolling_state"] = {
+                "fmaps_seq": last_window_fmaps[:, :, carry_start:].detach().clone().contiguous(),
+                "depths_seq": last_window_depths[:, :, carry_start:].detach().clone().contiguous(),
+                "feat_init": feat_init_unsorted[:, :, :persistent_query_count].detach().clone().contiguous(),
+                "last_coords": last_coords_unsorted[:, carry_start:, :persistent_query_count].detach().clone().contiguous(),
+                "last_vis": last_vis_unsorted[:, carry_start:, :persistent_query_count].detach().clone().contiguous(),
+            }
         if self.is_train:
             results["train_data"] = {
                 "vis_predictions": vis_predictions,

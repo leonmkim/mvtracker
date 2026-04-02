@@ -56,6 +56,9 @@ class EvaluationPredictor(torch.nn.Module):
             query_points_view=None,
             **kwargs,
     ):
+        previous_state = kwargs.pop("previous_state", None)
+        return_rolling_state = bool(kwargs.pop("return_rolling_state", False))
+        use_persistent_query_state = previous_state is not None or return_rolling_state
         batch_size, num_views, num_frames, _, height_raw, width_raw = rgbs.shape
         _, num_points, _ = query_points_3d.shape
 
@@ -67,6 +70,12 @@ class EvaluationPredictor(torch.nn.Module):
 
         if batch_size != 1:
             raise NotImplementedError
+
+        if self.single_point and (previous_state is not None or return_rolling_state):
+            raise ValueError(
+                "previous_state / return_rolling_state are not supported when "
+                "EvaluationPredictor.single_point=True"
+            )
 
         # Interpolate the inputs to the desired resolution, if needed
         if self.interp_shape is None:
@@ -271,6 +280,9 @@ class EvaluationPredictor(torch.nn.Module):
                     save_debug_logs=save_debug_logs and point_idx == 0,
                     debug_logs_path=debug_logs_path,
                     query_points_view=query_points_view,
+                    previous_state=previous_state,
+                    persistent_query_count=(1 if use_persistent_query_state else None),
+                    return_rolling_state=return_rolling_state,
                     **kwargs,
                 )
                 traj_e[:, :, point_idx: point_idx + 1] = results_i["traj_e"][:, :, :1]
@@ -354,6 +366,9 @@ class EvaluationPredictor(torch.nn.Module):
                 save_debug_logs=save_debug_logs,
                 debug_logs_path=debug_logs_path,
                 query_points_view=query_points_view,
+                previous_state=previous_state,
+                persistent_query_count=(num_points if use_persistent_query_state else None),
+                return_rolling_state=return_rolling_state,
                 **kwargs,
             )
             traj_e = results["traj_e"][:, :, :num_points, :]
@@ -407,11 +422,14 @@ class EvaluationPredictor(torch.nn.Module):
                         save_video=True,
                     )
 
-        return {
+        output = {
             "traj_e": traj_e,
             "vis_e": vis_e > self.visibility_threshold,
             "vis_e_as_prob": vis_e,
         }
+        if return_rolling_state and "rolling_state" in results:
+            output["rolling_state"] = results["rolling_state"]
+        return output
 
 
 def get_uniformly_sampled_pts(
